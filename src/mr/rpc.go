@@ -9,6 +9,14 @@ package mr
 import "os"
 import "strconv"
 
+type TaskType uint8
+
+const (
+	TASK_MAP TaskType = iota
+	TASK_REDUCE
+	TASK_NONE
+)
+
 //
 // example to show how to declare the arguments
 // and reply for an RPC.
@@ -22,8 +30,24 @@ type ExampleReply struct {
 	Y int
 }
 
-// Add your RPC definitions here.
+type GetTaskArgs struct{}
 
+type GetTaskReply struct {
+	Filename []string
+	TaskType TaskType
+	Id       int
+	NReduce  int
+}
+
+type MarkTaskAsDoneArgs struct {
+	Id       int
+	TaskType TaskType
+}
+
+type MarkTaskAsDoneReply struct {
+}
+
+// Add your RPC definitions here.
 
 // Cook up a unique-ish UNIX-domain socket name
 // in /var/tmp, for the coordinator.
