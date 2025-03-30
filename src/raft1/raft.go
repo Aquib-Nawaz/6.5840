@@ -7,6 +7,9 @@ package raft
 // Make() creates a new raft peer that implements the raft interface.
 
 import (
+	"6.5840/labgob"
+	tester "6.5840/tester1"
+	"bytes"
 	"fmt"
 	//	"bytes"
 	"math/rand"
@@ -17,7 +20,6 @@ import (
 	//	"6.5840/labgob"
 	"6.5840/labrpc"
 	"6.5840/raftapi"
-	"6.5840/tester1"
 )
 
 type LogEntry struct {
@@ -50,9 +52,17 @@ type Raft struct {
 
 // return currentTerm and whether this server
 // believes it is the leader.
-func (rf *Raft) GetState() (int, bool) {
+func (rf *Raft) GetState() (term int, isLeader bool) {
+	rf.mu.Lock()
+	term, isLeader = rf.currentTerm, rf.isLeader
+	rf.mu.Unlock()
+	return
+}
 
-	return rf.currentTerm, rf.isLeader
+type EncodingInterface struct {
+	CurrentTerm int
+	VotedFor    int
+	Logs        []LogEntry
 }
 
 // save Raft's persistent state to stable storage,
@@ -65,12 +75,20 @@ func (rf *Raft) GetState() (int, bool) {
 func (rf *Raft) persist() {
 	// Your code here (3C).
 	// Example:
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
 	// e.Encode(rf.xxx)
 	// e.Encode(rf.yyy)
-	// raftstate := w.Bytes()
-	// rf.persister.Save(raftstate, nil)
+	rf.mu.Lock()
+	toSave := EncodingInterface{CurrentTerm: rf.currentTerm,
+		VotedFor: rf.votedFor, Logs: rf.logs}
+
+	e.Encode(toSave)
+	raftstate := w.Bytes()
+	rf.mu.Unlock()
+
+	rf.persister.Save(raftstate, nil)
+
 }
 
 // restore previously persisted state.
@@ -80,17 +98,21 @@ func (rf *Raft) readPersist(data []byte) {
 	}
 	// Your code here (3C).
 	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+
+	var toRestore EncodingInterface
+
+	if d.Decode(&toRestore) != nil {
+		fmt.Println("failed to decode")
+	} else {
+		rf.mu.Lock()
+		rf.currentTerm = toRestore.CurrentTerm
+		rf.votedFor = toRestore.VotedFor
+		rf.logs = toRestore.Logs
+		rf.mu.Unlock()
+	}
+
 }
 
 // how many bytes in Raft's persisted log?
@@ -169,9 +191,9 @@ type AppendEntriesReply struct {
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	rf.mu.Lock()
 	debugf(rf.me, fmt.Sprintf("AppendEntries received via RPC from %d in term %d args %v", args.LeaderId,
 		rf.currentTerm, args))
-	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	reply.Term = rf.currentTerm
 	reply.XLen = len(rf.logs)
@@ -222,6 +244,7 @@ func (rf *Raft) applyCommittedEntries(nextCommit int) {
 		}
 	}
 	debugf(rf.me, fmt.Sprintf("Applying Entries from %d to %d", rf.commitIndex+1, nextCommit))
+	go rf.persist()
 	rf.commitIndex = nextCommit
 }
 
@@ -294,16 +317,16 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 	index := -1
 	term := -1
+	rf.mu.Lock()
 	isLeader := rf.isLeader
 
 	// Your code here (3B).
 	if isLeader {
-		rf.mu.Lock()
 		index = len(rf.logs)
 		rf.logs = append(rf.logs, LogEntry{rf.currentTerm, command})
 		term = rf.currentTerm
-		rf.mu.Unlock()
 	}
+	rf.mu.Unlock()
 	return index, term, isLeader
 }
 
@@ -358,6 +381,8 @@ func (rf *Raft) ticker() {
 
 func (rf *Raft) startElection() {
 	debugf(rf.me, "Starting Election")
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	for i := 0; i < len(rf.peers); i++ {
 		if i != rf.me {
 			go rf.sendRequestVote(i, &RequestVoteArgs{
@@ -371,8 +396,12 @@ func (rf *Raft) startElection() {
 }
 
 func (rf *Raft) sendAppendEntriesTicker() {
-	for !rf.killed() && rf.isLeader {
+	for !rf.killed() {
 		rf.mu.Lock()
+		if !rf.isLeader {
+			rf.mu.Unlock()
+			continue
+		}
 		debugf(rf.me, "Sending Append Entries to all peers")
 		for i := 0; i < len(rf.peers); i++ {
 			if i != rf.me {
@@ -394,7 +423,7 @@ func (rf *Raft) sendAppendEntriesTicker() {
 }
 
 func debugf(idx int, msg string) {
-	if true {
+	if false {
 
 		fmt.Printf("%v Peer:-%v "+msg+"\n", time.Now().Format("15:04:05.000"), idx)
 	}
@@ -420,6 +449,9 @@ func (rf *Raft) sendAppendEntries(i int, a *AppendEntriesArgs, reply *AppendEntr
 }
 
 func (rf *Raft) getEntries(i int) []LogEntry {
+	if rf.nextIndex[i] == 0 {
+		rf.nextIndex[i] = 1
+	}
 	if len(rf.logs) > rf.nextIndex[i] {
 		return rf.logs[rf.nextIndex[i]:]
 	}
@@ -446,7 +478,7 @@ func (rf *Raft) getNextIndexForFailure(prevIndex int, reply *AppendEntriesReply)
 
 func (rf *Raft) checkForCommitIndexUpdate(replicatedIdx int) {
 
-	for i := replicatedIdx; i > rf.commitIndex; i-- {
+	for i := replicatedIdx; i > rf.commitIndex && rf.logs[i].Term == rf.currentTerm; i-- {
 		followersCommitted := 1
 		for j := 0; j < len(rf.peers); j++ {
 			if j == rf.me {
@@ -480,6 +512,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 	rf.logs = make([]LogEntry, 1)
 	rf.logs[0].Term = 0
+	rf.logs[0].Command = 0
 	rf.isLeader = false
 	rf.votedFor = -1
 	rf.nextIndex = make([]int, len(rf.peers))
