@@ -79,15 +79,15 @@ func (rf *Raft) persist() {
 	e := labgob.NewEncoder(w)
 	// e.Encode(rf.xxx)
 	// e.Encode(rf.yyy)
-	rf.mu.Lock()
 	toSave := EncodingInterface{CurrentTerm: rf.currentTerm,
 		VotedFor: rf.votedFor, Logs: rf.logs}
 
 	e.Encode(toSave)
 	raftstate := w.Bytes()
-	rf.mu.Unlock()
+	//rf.mu.Unlock()
 
 	rf.persister.Save(raftstate, nil)
+	//rf.mu.Lock()
 
 }
 
@@ -111,6 +111,7 @@ func (rf *Raft) readPersist(data []byte) {
 		rf.votedFor = toRestore.VotedFor
 		rf.logs = toRestore.Logs
 		rf.mu.Unlock()
+		//fmt.Printf("readPersist: %v\n", toRestore)
 	}
 
 }
@@ -160,8 +161,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	reply.Term = rf.currentTerm
 	reply.VoteGranted = false
 	if args.Term > rf.currentTerm {
-		rf.votedFor = -1
-		rf.currentTerm = args.Term
+		rf.createNewTerm(args.Term)
 	}
 	if args.Term >= rf.currentTerm && (rf.votedFor == -1 || rf.votedFor == args.CandidateId) {
 		if args.LastLogTerm > rf.logs[len(rf.logs)-1].Term || (args.LastLogTerm == rf.logs[len(rf.logs)-1].Term && args.LastLogIndex >= len(rf.logs)-1) {
@@ -171,6 +171,12 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			rf.currentTerm = args.Term
 		}
 	}
+}
+
+func (rf *Raft) createNewTerm(term int) {
+	rf.votedFor = -1
+	rf.currentTerm = term
+	rf.isLeader = false
 }
 
 type AppendEntriesArgs struct {
@@ -193,7 +199,7 @@ type AppendEntriesReply struct {
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	debugf(rf.me, fmt.Sprintf("AppendEntries received via RPC from %d in term %d args %v", args.LeaderId,
-		rf.currentTerm, args))
+		rf.currentTerm, len(args.Entries)))
 	defer rf.mu.Unlock()
 	reply.Term = rf.currentTerm
 	reply.XLen = len(rf.logs)
@@ -202,41 +208,51 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if args.Term < rf.currentTerm {
 		return
 	}
-	reply.Term = args.Term
-	rf.currentTerm = args.Term
 	if rf.leaderId != args.LeaderId {
 		rf.leaderId = args.LeaderId
 		debugf(rf.me, fmt.Sprintf("Chose new leader %d for term %d", rf.leaderId, rf.currentTerm))
 	}
-	rf.votedFor = -1
-	rf.isLeader = false
+	rf.createNewTerm(args.Term)
+	reply.Term = rf.currentTerm
 	rf.lastCommunicationtime = time.Now()
 
 	if len(rf.logs) <= args.PrevLogIndex {
 		debugf(rf.me, fmt.Sprintf("AppendEntries: log too short %d %d", len(rf.logs), args.PrevLogIndex))
+		//fmt.Printf("Peer:- %v Term:- %v log too short %d %d\n", rf.me, rf.currentTerm, len(rf.logs), args.PrevLogIndex)
 		return
 	}
+
 	if confTerm := rf.logs[args.PrevLogIndex].Term; confTerm != args.PrevLogTerm {
 		reply.ConflictTerm = confTerm
 		confIdx := args.PrevLogIndex
 		for ; confIdx >= 0 && rf.logs[confIdx].Term == confTerm; confIdx-- {
 		}
 		reply.ConflictIndex = confIdx + 1
+		if reply.ConflictIndex == 0 {
+			//fmt.Printf("Peer:- %v Term:- %v ConflictIndex:- 0, Args:- %v, Reply:- %v, Logs:- %v\n",
+			//	rf.me, rf.currentTerm, args, reply, rf.logs)
+		}
 		debugf(rf.me, fmt.Sprintf("AppendEntries: log conflict prevLogIndex %d prevLogTerm %d conflictIndex %d conflictTerm %d",
 			args.PrevLogIndex, args.PrevLogTerm, reply.ConflictIndex, reply.ConflictTerm))
 		return
 	}
+
+	var prevLogLen = len(rf.logs)
 	rf.logs = rf.logs[:args.PrevLogIndex+1]
 	rf.logs = append(rf.logs, args.Entries...)
 	if args.LeaderCommit > rf.commitIndex {
-		rf.applyCommittedEntries(args.LeaderCommit)
+		rf.applyCommittedEntries(min(args.LeaderCommit, len(rf.logs)-1))
+	} else if prevLogLen > len(rf.logs) {
+		rf.persist()
 	}
 	reply.Success = 1
-	debugf(rf.me, fmt.Sprintf("Succesfully Replicated Entries %v at index %d", args.Entries, args.PrevLogIndex+1))
+	debugf(rf.me, fmt.Sprintf("Succesfully Replicated Entries %v at index %d", len(args.Entries), args.PrevLogIndex+1))
 }
 
 func (rf *Raft) applyCommittedEntries(nextCommit int) {
+	rf.persist()
 	for idx := rf.commitIndex + 1; idx <= nextCommit; idx++ {
+		//fmt.Printf("Peer:- %v Committing %v at index %d\n", rf.me, rf.logs[idx].Command, idx)
 		rf.applyCh <- raftapi.ApplyMsg{
 			CommandValid: true,
 			Command:      rf.logs[idx].Command,
@@ -244,8 +260,8 @@ func (rf *Raft) applyCommittedEntries(nextCommit int) {
 		}
 	}
 	debugf(rf.me, fmt.Sprintf("Applying Entries from %d to %d", rf.commitIndex+1, nextCommit))
-	go rf.persist()
 	rf.commitIndex = nextCommit
+
 }
 
 // example code to send a RequestVote RPC to a server.
@@ -282,12 +298,13 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 		defer rf.mu.Unlock()
 		debugf(rf.me, fmt.Sprintf("received vote %v from %d", reply.VoteGranted, server))
 		if reply.Term > rf.currentTerm {
-			rf.currentTerm = reply.Term
-			rf.votedFor = -1 //no longer candidate
-		} else if reply.VoteGranted {
+			rf.createNewTerm(reply.Term)
+		} else if reply.VoteGranted && reply.Term == rf.currentTerm {
 			rf.voteReceived++
+			//fmt.Printf("Peer:- %v Term:- %v Received Vote from %d\n", rf.me, rf.currentTerm, server)
 			if rf.isLeader == false && 2*rf.voteReceived > len(rf.peers) {
 				debugf(rf.me, "becoming leader")
+				//fmt.Printf("Peer:- %v Term:- %v Became Leader\n", rf.me, rf.currentTerm)
 				rf.isLeader = true
 				for idx := range rf.peers {
 					rf.nextIndex[idx] = len(rf.logs)
@@ -323,6 +340,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	// Your code here (3B).
 	if isLeader {
 		index = len(rf.logs)
+		//fmt.Printf("Peer:- %v Appending %v at index %d\n", rf.me, command, index)
 		rf.logs = append(rf.logs, LogEntry{rf.currentTerm, command})
 		term = rf.currentTerm
 	}
@@ -370,19 +388,15 @@ func (rf *Raft) ticker() {
 
 			rf.voteReceived = 1
 			rf.lastCommunicationtime = time.Now()
-			rf.mu.Unlock()
-
-			go rf.startElection()
-		} else {
-			rf.mu.Unlock()
+			rf.startElection()
 		}
+		rf.mu.Unlock()
+
 	}
 }
 
 func (rf *Raft) startElection() {
 	debugf(rf.me, "Starting Election")
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
 	for i := 0; i < len(rf.peers); i++ {
 		if i != rf.me {
 			go rf.sendRequestVote(i, &RequestVoteArgs{
@@ -400,7 +414,7 @@ func (rf *Raft) sendAppendEntriesTicker() {
 		rf.mu.Lock()
 		if !rf.isLeader {
 			rf.mu.Unlock()
-			continue
+			break
 		}
 		debugf(rf.me, "Sending Append Entries to all peers")
 		for i := 0; i < len(rf.peers); i++ {
@@ -418,40 +432,51 @@ func (rf *Raft) sendAppendEntriesTicker() {
 		}
 
 		rf.mu.Unlock()
-		time.Sleep(100 * time.Millisecond)
+		time.Sleep(150 * time.Millisecond)
 	}
 }
 
 func debugf(idx int, msg string) {
 	if false {
-
 		fmt.Printf("%v Peer:-%v "+msg+"\n", time.Now().Format("15:04:05.000"), idx)
 	}
 }
 func (rf *Raft) sendAppendEntries(i int, a *AppendEntriesArgs, reply *AppendEntriesReply) {
+	//fmt.Printf("Peer:- %v Term:- %v Expecting to update nextIndex for peer %v to %v\n", rf.me, rf.currentTerm, i, a.PrevLogIndex+len(a.Entries)+1)
 	ok := rf.peers[i].Call("Raft.AppendEntries", a, reply)
 	if ok {
 		rf.mu.Lock()
+		if !rf.isLeader {
+			rf.mu.Unlock()
+			return
+		}
 		if reply.Term > rf.currentTerm {
-			rf.currentTerm = reply.Term
-			rf.isLeader = false
-		} else if reply.Success == 1 {
+			rf.createNewTerm(reply.Term)
+			rf.mu.Unlock()
+			return
+		}
+		if reply.Term < rf.currentTerm {
+			rf.mu.Unlock()
+			return
+		}
+		if reply.Success == 1 {
+			debugf(rf.me, fmt.Sprintf("Updated nextIndex for peer %v from %v to %v", i, rf.nextIndex[i], a.PrevLogIndex+len(a.Entries)+1))
 			rf.nextIndex[i] = a.PrevLogIndex + len(a.Entries) + 1
 			rf.matchIndex[i] = rf.nextIndex[i] - 1
 
 			rf.checkForCommitIndexUpdate(rf.nextIndex[i] - 1)
 
-		} else if reply.Success == 0 {
+		} else {
 			rf.nextIndex[i] = rf.getNextIndexForFailure(a.PrevLogIndex, reply)
 		}
+		//fmt.Printf("Peer:- %v Term:- %v Updated nextIndex for peer %v to %v\n", rf.me, rf.currentTerm, i, rf.nextIndex[i])
+
 		rf.mu.Unlock()
 	}
 }
 
 func (rf *Raft) getEntries(i int) []LogEntry {
-	if rf.nextIndex[i] == 0 {
-		rf.nextIndex[i] = 1
-	}
+
 	if len(rf.logs) > rf.nextIndex[i] {
 		return rf.logs[rf.nextIndex[i]:]
 	}
@@ -464,16 +489,24 @@ func (rf *Raft) getNextIndexForFailure(prevIndex int, reply *AppendEntriesReply)
 		return reply.XLen
 	}
 	var conflictTermIdx = -1
+	debugf(rf.me, fmt.Sprintf("Peer:- %v Term:- %v getNextIndexForFailure: prevIndex %v, reply %v",
+		rf.me, rf.currentTerm, prevIndex, reply))
 	for idx := prevIndex; idx >= 0 && rf.logs[idx].Term > reply.Term; idx-- {
 		if rf.logs[idx].Term == reply.Term {
 			conflictTermIdx = idx
 			break
 		}
 	}
+	var ret = conflictTermIdx
+
 	if conflictTermIdx == -1 {
-		return reply.ConflictIndex
+		ret = reply.ConflictIndex
 	}
-	return conflictTermIdx
+	if ret == 0 {
+		//fmt.Printf("Peer:- %v Term:- %v getNextIndexForFailure: prevIndex %v, reply %v\n", rf.me, rf.currentTerm,
+		//	prevIndex, reply)
+	}
+	return ret
 }
 
 func (rf *Raft) checkForCommitIndexUpdate(replicatedIdx int) {
@@ -488,7 +521,7 @@ func (rf *Raft) checkForCommitIndexUpdate(replicatedIdx int) {
 				followersCommitted++
 			}
 		}
-		if followersCommitted > len(rf.peers)/2 {
+		if 2*followersCommitted > len(rf.peers) {
 			rf.applyCommittedEntries(i)
 			break
 		}
