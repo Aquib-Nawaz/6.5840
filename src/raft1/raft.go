@@ -53,7 +53,7 @@ type Raft struct {
 	snapshot              []byte
 }
 
-type InstallRPCArgs struct {
+type InstallSnapshotRPCArgs struct {
 	Term              int
 	LeaderId          int
 	LastIncludedIndex int
@@ -61,11 +61,11 @@ type InstallRPCArgs struct {
 	Data              []byte
 }
 
-type InstallRPCReply struct {
+type InstallSnapshotRPCReply struct {
 	Term int
 }
 
-func (rf *Raft) InstallSnapshot(args *InstallRPCArgs, reply *InstallRPCReply) {
+func (rf *Raft) InstallSnapshot(args *InstallSnapshotRPCArgs, reply *InstallSnapshotRPCReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	if args.Term < rf.currentTerm {
@@ -76,16 +76,18 @@ func (rf *Raft) InstallSnapshot(args *InstallRPCArgs, reply *InstallRPCReply) {
 	if rf.currentTerm < args.Term {
 		rf.createNewTerm(rf.currentTerm)
 	}
-	if rf.logIdxOffset > args.LastIncludedIndex {
+	if rf.logIdxOffset >= args.LastIncludedIndex {
 		return
 	}
-	if rf.getEntryWithAbsoluteIndex(args.LastIncludedIndex).Term != args.LastIncludedTerm {
+	if args.LastIncludedIndex >= len(rf.logs)+rf.logIdxOffset || rf.getEntryWithAbsoluteIndex(args.LastIncludedIndex).Term != args.LastIncludedTerm {
 		rf.logs = make([]LogEntry, 1)
 		rf.logs[0].Term = args.LastIncludedTerm
 	} else {
 		rf.logs = rf.logs[args.LastIncludedIndex-rf.logIdxOffset:]
 	}
-	rf.logIdxOffset = args.LastIncludedIndex
+	rf.logIdxOffset, rf.commitIndex = args.LastIncludedIndex, args.LastIncludedIndex
+	rf.snapshot = args.Data
+	fmt.Printf("Peer:- %v Term:- %v Received Snapshot till index %v\n", rf.me, rf.currentTerm, rf.logIdxOffset)
 }
 
 // return currentTerm and whether this server
@@ -120,7 +122,7 @@ func (rf *Raft) persist() {
 	// e.Encode(rf.xxx)
 	// e.Encode(rf.yyy)
 	if rf.snapshot != nil {
-		fmt.Printf("Peer:- %v rf.persist start\n", rf.me)
+		fmt.Printf("Peer:- %v rf.persist\n", rf.me)
 	}
 	toSave := EncodingInterface{CurrentTerm: rf.currentTerm,
 		VotedFor: rf.votedFor, Logs: rf.logs}
@@ -148,7 +150,7 @@ func (rf *Raft) readPersist(data []byte) {
 	d := labgob.NewDecoder(r)
 
 	var toRestore EncodingInterface
-	fmt.Printf("Peer:- %v rf.persist\n", rf.me)
+	fmt.Printf("Peer:- %v Term:- %v rf.readPersist\n", rf.me, rf.currentTerm)
 	if d.Decode(&toRestore) != nil {
 		fmt.Println("failed to decode")
 	} else {
@@ -157,7 +159,8 @@ func (rf *Raft) readPersist(data []byte) {
 		rf.votedFor = toRestore.VotedFor
 		rf.logs = toRestore.Logs
 		rf.logIdxOffset = toRestore.LastSnapshotIndex
-		rf.lastApplied = toRestore.LastSnapshotIndex
+		rf.commitIndex = toRestore.LastSnapshotIndex
+		rf.snapshot = rf.persister.ReadSnapshot()
 		rf.mu.Unlock()
 		//fmt.Printf("readPersist: %v\n", toRestore)
 	}
@@ -331,13 +334,18 @@ func (rf *Raft) applyCommittedEntriesTicker() {
 		toApply := make([]raftapi.ApplyMsg, 0)
 		if rf.snapshot != nil && rf.lastApplied < rf.logIdxOffset {
 			toApply = append(toApply, raftapi.ApplyMsg{
-				CommandValid:  false,
 				Snapshot:      rf.snapshot,
 				SnapshotValid: true,
 				SnapshotIndex: rf.logIdxOffset,
 				SnapshotTerm:  rf.logs[0].Term,
 			})
+			fmt.Printf("Peer:- %v Term:- %v Trying to apply snapshot till index %v\n", rf.me, rf.currentTerm,
+				rf.logIdxOffset)
 		} else {
+			if rf.commitIndex > rf.lastApplied {
+				fmt.Printf("Peer:- %v Term:- %v Trying to apply entries from %v till index %v with log offset %v\n",
+					rf.me, rf.currentTerm, rf.lastApplied+1, rf.commitIndex, rf.logIdxOffset)
+			}
 			for idx := rf.lastApplied + 1; idx <= rf.commitIndex; idx++ {
 				toApply = append(toApply, raftapi.ApplyMsg{
 					CommandValid: true,
@@ -514,15 +522,25 @@ func (rf *Raft) sendAppendEntriesTicker() {
 		debugf(rf.me, "Sending Append Entries to all peers")
 		for i := 0; i < len(rf.peers); i++ {
 			if i != rf.me {
-				entries := rf.getEntries(i)
-				go rf.sendAppendEntries(i, &AppendEntriesArgs{
-					Term:         rf.currentTerm,
-					LeaderId:     rf.me,
-					PrevLogIndex: rf.nextIndex[i] - 1,
-					PrevLogTerm:  rf.getEntryWithAbsoluteIndex(rf.nextIndex[i] - 1).Term,
-					Entries:      entries,
-					LeaderCommit: rf.commitIndex,
-				}, &AppendEntriesReply{})
+				if rf.nextIndex[i] > rf.logIdxOffset {
+					entries := rf.getEntries(i)
+					go rf.sendAppendEntries(i, &AppendEntriesArgs{
+						Term:         rf.currentTerm,
+						LeaderId:     rf.me,
+						PrevLogIndex: rf.nextIndex[i] - 1,
+						PrevLogTerm:  rf.getEntryWithAbsoluteIndex(rf.nextIndex[i] - 1).Term,
+						Entries:      entries,
+						LeaderCommit: rf.commitIndex,
+					}, &AppendEntriesReply{})
+				} else {
+					go rf.sendInstallSnapshot(i, &InstallSnapshotRPCArgs{
+						Term:              rf.currentTerm,
+						LeaderId:          rf.me,
+						LastIncludedIndex: rf.logIdxOffset,
+						LastIncludedTerm:  rf.logs[0].Term,
+						Data:              rf.snapshot,
+					})
+				}
 			}
 		}
 
@@ -620,6 +638,29 @@ func (rf *Raft) checkForCommitIndexUpdate(replicatedIdx int) {
 			rf.applyCommittedEntries(i)
 			break
 		}
+	}
+}
+
+func (rf *Raft) sendInstallSnapshot(i int, args *InstallSnapshotRPCArgs) {
+	reply := InstallSnapshotRPCReply{}
+	ok := rf.peers[i].Call("Raft.InstallSnapshot", args, &reply)
+	if ok {
+		rf.mu.Lock()
+		if !rf.isLeader {
+			rf.mu.Unlock()
+			return
+		}
+		if reply.Term > rf.currentTerm {
+			rf.createNewTerm(reply.Term)
+			rf.mu.Unlock()
+			return
+		}
+		if rf.nextIndex[i] < args.LastIncludedIndex+1 {
+			rf.nextIndex[i] = args.LastIncludedIndex + 1
+			//rf.matchIndex[i] = args.LastIncludedIndex //useless will not be used as data is already committed
+		}
+		rf.mu.Unlock()
+
 	}
 }
 
