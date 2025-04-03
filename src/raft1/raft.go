@@ -19,7 +19,7 @@ import (
 	//	"6.5840/labgob"
 	"6.5840/labrpc"
 	"6.5840/raftapi"
-	"github.com/ietxaniz/delock"
+	"github.com/sasha-s/go-deadlock"
 )
 
 type LogEntry struct {
@@ -29,7 +29,7 @@ type LogEntry struct {
 
 // A Go object implementing a single Raft peer.
 type Raft struct {
-	mu           delock.Mutex        // Lock to protect shared access to this peer's state
+	mu           deadlock.Mutex      // Lock to protect shared access to this peer's state
 	peers        []*labrpc.ClientEnd // RPC end points of all peers
 	persister    *tester.Persister   // Object to hold this peer's persisted state
 	me           int                 // this peer's index into peers[]
@@ -49,6 +49,8 @@ type Raft struct {
 	commitIndex           int
 	applyCh               chan raftapi.ApplyMsg
 	logIdxOffset          int
+	lastApplied           int
+	snapshot              []byte
 }
 
 type InstallRPCArgs struct {
@@ -84,7 +86,6 @@ func (rf *Raft) InstallSnapshot(args *InstallRPCArgs, reply *InstallRPCReply) {
 		rf.logs = rf.logs[args.LastIncludedIndex-rf.logIdxOffset:]
 	}
 	rf.logIdxOffset = args.LastIncludedIndex
-	rf.persist(args.Data)
 }
 
 // return currentTerm and whether this server
@@ -111,14 +112,14 @@ type EncodingInterface struct {
 // second argument to persister.Save().
 // after you've implemented snapshots, pass the current snapshot
 // (or nil if there's not yet a snapshot).
-func (rf *Raft) persist(snapshot []byte) {
+func (rf *Raft) persist() {
 	// Your code here (3C).
 	// Example:
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
 	// e.Encode(rf.xxx)
 	// e.Encode(rf.yyy)
-	if snapshot != nil {
+	if rf.snapshot != nil {
 		fmt.Printf("Peer:- %v rf.persist start\n", rf.me)
 	}
 	toSave := EncodingInterface{CurrentTerm: rf.currentTerm,
@@ -128,13 +129,11 @@ func (rf *Raft) persist(snapshot []byte) {
 	}
 	e.Encode(toSave)
 	raftstate := w.Bytes()
-	//rf.mu.Unlock()
+	rf.mu.Unlock()
 
-	rf.persister.Save(raftstate, snapshot)
-	if snapshot != nil {
-		fmt.Printf("Peer:- %v rf.persist finish\n", rf.me)
-	}
-	//rf.mu.Lock()
+	rf.persister.Save(raftstate, rf.snapshot)
+
+	rf.mu.Lock()
 
 }
 
@@ -158,8 +157,9 @@ func (rf *Raft) readPersist(data []byte) {
 		rf.votedFor = toRestore.VotedFor
 		rf.logs = toRestore.Logs
 		rf.logIdxOffset = toRestore.LastSnapshotIndex
+		rf.lastApplied = toRestore.LastSnapshotIndex
 		rf.mu.Unlock()
-		fmt.Printf("readPersist: %v\n", toRestore)
+		//fmt.Printf("readPersist: %v\n", toRestore)
 	}
 
 }
@@ -180,11 +180,15 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	fmt.Printf("Peer:- %v before Snapshot %v offset %v log length %v\n", rf.me, index, rf.logIdxOffset, len(rf.logs))
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	fmt.Printf("Peer:- %v after Snapshot %v offset %v log length %v\n", rf.me, index, rf.logIdxOffset, len(rf.logs))
+	//fmt.Printf("Peer:- %v after Snapshot %v offset %v log length %v\n", rf.me, index, rf.logIdxOffset, len(rf.logs))
 	rf.logs = rf.logs[index-rf.logIdxOffset:]
+	prevOffset := rf.logIdxOffset
 	rf.logIdxOffset = index
-	//rf.snaphot = snapshot
-	//rf.persist(snapshot)
+	rf.snapshot = snapshot
+	if prevOffset != rf.logIdxOffset {
+		rf.persist()
+	}
+	//rf.persist()
 	fmt.Printf("Peer:- %v Snapshot %v offset %v log length %v\n", rf.me, index, rf.logIdxOffset, len(rf.logs))
 
 }
@@ -303,7 +307,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if args.LeaderCommit > rf.commitIndex {
 		rf.applyCommittedEntries(min(args.LeaderCommit, len(rf.logs)-1+rf.logIdxOffset))
 	} else if prevLogLen != len(rf.logs) || len(args.Entries) > 0 {
-		rf.persist(nil)
+		rf.persist()
 	}
 	reply.Success = 1
 	debugf(rf.me, fmt.Sprintf("Succesfully Replicated Entries %v at index %d", len(args.Entries), args.PrevLogIndex+1))
@@ -314,17 +318,45 @@ func (rf *Raft) getEntryWithAbsoluteIndex(index int) LogEntry {
 }
 
 func (rf *Raft) applyCommittedEntries(nextCommit int) {
-	rf.persist(nil)
-	for idx := rf.commitIndex + 1; idx <= nextCommit; idx++ {
-		//fmt.Printf("Peer:- %v Committing %v at index %d\n", rf.me, rf.logs[idx].Command, idx)
-		rf.applyCh <- raftapi.ApplyMsg{
-			CommandValid: true,
-			Command:      rf.getEntryWithAbsoluteIndex(idx).Command,
-			CommandIndex: idx,
+	rf.persist()
+	if nextCommit > rf.commitIndex {
+		rf.commitIndex = nextCommit
+	}
+
+}
+
+func (rf *Raft) applyCommittedEntriesTicker() {
+	for rf.killed() == false {
+		rf.mu.Lock()
+		toApply := make([]raftapi.ApplyMsg, 0)
+		if rf.snapshot != nil && rf.lastApplied < rf.logIdxOffset {
+			toApply = append(toApply, raftapi.ApplyMsg{
+				CommandValid:  false,
+				Snapshot:      rf.snapshot,
+				SnapshotValid: true,
+				SnapshotIndex: rf.logIdxOffset,
+				SnapshotTerm:  rf.logs[0].Term,
+			})
+		} else {
+			for idx := rf.lastApplied + 1; idx <= rf.commitIndex; idx++ {
+				toApply = append(toApply, raftapi.ApplyMsg{
+					CommandValid: true,
+					Command:      rf.getEntryWithAbsoluteIndex(idx).Command,
+					CommandIndex: idx,
+				})
+			}
+		}
+		rf.mu.Unlock()
+
+		for _, msg := range toApply {
+			rf.applyCh <- msg
+			if msg.CommandValid {
+				rf.lastApplied++
+			} else {
+				rf.lastApplied = msg.SnapshotIndex
+			}
 		}
 	}
-	debugf(rf.me, fmt.Sprintf("Applying Entries from %d to %d", rf.commitIndex+1, nextCommit))
-	rf.commitIndex = nextCommit
 }
 
 // example code to send a RequestVote RPC to a server.
@@ -500,7 +532,7 @@ func (rf *Raft) sendAppendEntriesTicker() {
 }
 
 func debugf(idx int, msg string) {
-	if true {
+	if false {
 		fmt.Printf("%v Peer:-%v "+msg+"\n", time.Now().Format("15:04:05.000"), idx)
 	}
 }
@@ -621,6 +653,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	}
 	// start ticker goroutine to start elections
 	go rf.ticker()
-
+	go rf.applyCommittedEntriesTicker()
 	return rf
 }
