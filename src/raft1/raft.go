@@ -131,11 +131,8 @@ func (rf *Raft) persist() {
 	}
 	e.Encode(toSave)
 	raftstate := w.Bytes()
-	rf.mu.Unlock()
 
 	rf.persister.Save(raftstate, rf.snapshot)
-
-	rf.mu.Lock()
 
 }
 
@@ -484,8 +481,9 @@ func (rf *Raft) ticker() {
 		rf.mu.Lock()
 		debugf(rf.me, fmt.Sprintf("Woke up after %v ms, last communication %v", ms.Milliseconds(), rf.lastCommunicationtime.Format(
 			"15:04:05.000")))
-		if !rf.isLeader && time.Now().Sub(rf.lastCommunicationtime) > ms {
+		if time.Now().Sub(rf.lastCommunicationtime) > ms {
 			//start election
+			rf.isLeader = false
 			rf.currentTerm++
 			rf.votedFor = rf.me
 
@@ -568,6 +566,7 @@ func (rf *Raft) sendAppendEntries(i int, a *AppendEntriesArgs, reply *AppendEntr
 			rf.mu.Unlock()
 			return
 		}
+		rf.lastCommunicationtime = time.Now()
 		if reply.Term < rf.currentTerm {
 			rf.mu.Unlock()
 			return
