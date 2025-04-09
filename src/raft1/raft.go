@@ -144,7 +144,7 @@ func (rf *Raft) readPersist(data []byte) {
 	d := labgob.NewDecoder(r)
 
 	var toRestore EncodingInterface
-	fmt.Printf("Peer:- %v Term:- %v rf.readPersist\n", rf.me, rf.currentTerm)
+	fmt.Printf("Peer:- %v  rf.readPersist\n", rf.me)
 	if d.Decode(&toRestore) != nil {
 		fmt.Println("failed to decode")
 	} else {
@@ -154,7 +154,7 @@ func (rf *Raft) readPersist(data []byte) {
 		rf.logs = toRestore.Logs
 		rf.logIdxOffset = toRestore.LastSnapshotIndex
 		rf.commitIndex = toRestore.LastSnapshotIndex
-		rf.snapshot = rf.persister.ReadSnapshot()
+		rf.lastApplied = toRestore.LastSnapshotIndex
 		rf.mu.Unlock()
 		//fmt.Printf("readPersist: %v\n", toRestore)
 	}
@@ -174,8 +174,8 @@ func (rf *Raft) PersistBytes() int {
 // that index. Raft should now trim its log as much as possible.
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// Your code here (3D).
-	fmt.Printf("Peer:- %v before Snapshot %v offset %v log length %v\n", rf.me, index, rf.logIdxOffset, len(rf.logs))
 	rf.mu.Lock()
+	fmt.Printf("Peer:- %v before Snapshot %v offset %v log length %v\n", rf.me, index, rf.logIdxOffset, len(rf.logs))
 	defer rf.mu.Unlock()
 	//fmt.Printf("Peer:- %v after Snapshot %v offset %v log length %v\n", rf.me, index, rf.logIdxOffset, len(rf.logs))
 	rf.logs = rf.logs[index-rf.logIdxOffset:]
@@ -284,7 +284,16 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		//fmt.Printf("Peer:- %v Term:- %v log too short %d %d\n", rf.me, rf.currentTerm, len(rf.logs), args.PrevLogIndex)
 		return
 	}
-
+	if args.PrevLogIndex < rf.logIdxOffset {
+		diff := rf.logIdxOffset - args.PrevLogIndex
+		if diff >= len(args.Entries) {
+			reply.Success = 1
+			return
+		}
+		args.PrevLogIndex += diff
+		args.PrevLogTerm = rf.logs[0].Term
+		args.Entries = args.Entries[diff:]
+	}
 	if confTerm := rf.getEntryWithAbsoluteIndex(args.PrevLogIndex).Term; confTerm != args.PrevLogTerm {
 		reply.ConflictTerm = confTerm
 		confIdx := args.PrevLogIndex
@@ -349,8 +358,8 @@ func (rf *Raft) applyCommittedEntriesTicker() {
 			//	rf.logIdxOffset)
 		} else {
 			if rf.commitIndex > rf.lastApplied {
-				//fmt.Printf("Peer:- %v Term:- %v Trying to apply entries from %v till index %v with log offset %v\n",
-				//rf.me, rf.currentTerm, rf.lastApplied+1, rf.commitIndex, rf.logIdxOffset)
+				fmt.Printf("Peer:- %v Term:- %v Trying to apply entries from %v till index %v with log offset %v\n",
+					rf.me, rf.currentTerm, rf.lastApplied+1, rf.commitIndex, rf.logIdxOffset)
 			}
 			for idx := rf.lastApplied + 1; idx <= rf.commitIndex; idx++ {
 				toApply = append(toApply, raftapi.ApplyMsg{
@@ -584,10 +593,12 @@ func (rf *Raft) sendAppendEntries(i int, a *AppendEntriesArgs, reply *AppendEntr
 		}
 		if reply.Success == 1 {
 			debugf(rf.me, fmt.Sprintf("Updated nextIndex for peer %v from %v to %v", i, rf.nextIndex[i], a.PrevLogIndex+len(a.Entries)+1))
-			rf.nextIndex[i] = a.PrevLogIndex + len(a.Entries) + 1
-			rf.matchIndex[i] = rf.nextIndex[i] - 1
-
-			rf.checkForCommitIndexUpdate(rf.nextIndex[i] - 1)
+			updatedNextIndex := a.PrevLogIndex + len(a.Entries) + 1
+			if updatedNextIndex > rf.nextIndex[i] {
+				rf.nextIndex[i] = updatedNextIndex
+				rf.matchIndex[i] = updatedNextIndex - 1
+				rf.checkForCommitIndexUpdate(rf.nextIndex[i] - 1)
+			}
 
 		} else {
 			rf.nextIndex[i] = rf.getNextIndexForFailure(a.PrevLogIndex, reply)

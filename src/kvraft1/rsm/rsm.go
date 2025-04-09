@@ -1,6 +1,8 @@
 package rsm
 
 import (
+	"6.5840/labgob"
+	"bytes"
 	"fmt"
 	"github.com/sasha-s/go-deadlock"
 	"time"
@@ -54,6 +56,11 @@ type RSM struct {
 	idxReceived int
 }
 
+type SnapEncode struct {
+	Data []byte
+	Idx  int
+}
+
 // servers[] contains the ports of the set of
 // servers that will cooperate via Raft to
 // form the fault-tolerant key/value service.
@@ -81,6 +88,17 @@ func MakeRSM(servers []*labrpc.ClientEnd, me int, persister *tester.Persister, m
 	}
 	rsm.mp = make(map[int]chan RetOp)
 	rsm.id = 1
+	snap := persister.ReadSnapshot()
+	if snap != nil && len(snap) > 0 {
+		r := bytes.NewBuffer(snap)
+		d := labgob.NewDecoder(r)
+		var toRestore SnapEncode
+		if d.Decode(&toRestore) != nil {
+			fmt.Println("failed to decode")
+		}
+		rsm.idxReceived = toRestore.Idx
+		rsm.sm.Restore(toRestore.Data)
+	}
 	go rsm.readApplyCh()
 	go rsm.checkForSnapshot()
 	return rsm
@@ -124,7 +142,7 @@ func (rsm *RSM) Submit(req any) (rpc.Err, any) {
 			for run {
 				select {
 				case msg, ok := <-ch:
-					fmt.Printf("RSM:- %v Received response: %v Waiting for Id %v\n", rsm.me, msg, op.Id)
+					//fmt.Printf("RSM:- %v Received response: %v Waiting for Id %v\n", rsm.me, msg, op.Id)
 					if ok && msg.Id == op.Id && msg.Me == rsm.me {
 						fmt.Printf("RSM:- %v Received response: %v\n", rsm.me, op.Id)
 						return rpc.OK, msg.Rep
@@ -134,7 +152,7 @@ func (rsm *RSM) Submit(req any) (rpc.Err, any) {
 					//rsm.mu.Lock()
 					//fmt.Printf("RSM:- %v Waiting for response: %v curr received %v\n", rsm.me, op.Id, rsm.idxReceived)
 					if _term, _ := rsm.Raft().GetState(); _term > term {
-						fmt.Printf("RSM:- %v Timed out: %v\n", rsm.me, op.Id)
+						//fmt.Printf("RSM:- %v Timed out: %v\n", rsm.me, op.Id)
 						run = false
 						go func() {
 							<-ch
@@ -158,7 +176,7 @@ func (rsm *RSM) readApplyCh() {
 			rsm.mu.Unlock()
 			if ok {
 				toSend := RetOp{Id: op.Id, Rep: rep, Me: rsm.me}
-				fmt.Printf("RSM:- %v Sending response to submit routine: %v\n", rsm.me, toSend)
+				//fmt.Printf("RSM:- %v Sending response to submit routine: %v\n", rsm.me, toSend)
 				val <- toSend
 				close(val)
 				rsm.mu.Lock()
@@ -166,9 +184,15 @@ func (rsm *RSM) readApplyCh() {
 				rsm.mu.Unlock()
 			}
 		} else if msg.SnapshotValid {
-			fmt.Printf("RSM:- %v Received snapshot: %v\n", rsm.me, msg.SnapshotIndex)
+			//fmt.Printf("RSM:- %v Received snapshot: %v\n", rsm.me, msg.SnapshotIndex)
 			rsm.mu.Lock()
-			rsm.sm.Restore(msg.Snapshot)
+			r := bytes.NewBuffer(msg.Snapshot)
+			d := labgob.NewDecoder(r)
+			var toRestore SnapEncode
+			if err := d.Decode(&toRestore); err != nil {
+				fmt.Printf("RSM:- %v failed to decode\n", rsm.me)
+			}
+			rsm.sm.Restore(toRestore.Data)
 			rsm.idxReceived = msg.SnapshotIndex
 			rsm.mu.Unlock()
 		}
@@ -190,7 +214,15 @@ func (rsm *RSM) checkForSnapshot() {
 			snap := rsm.sm.Snapshot()
 			idx := rsm.idxReceived
 			rsm.mu.Unlock()
-			rsm.rf.Snapshot(idx, snap)
+			toSave := SnapEncode{Data: snap, Idx: idx}
+			w := new(bytes.Buffer)
+			e := labgob.NewEncoder(w)
+			err := e.Encode(toSave)
+			if err != nil {
+				fmt.Printf("RSM:- %v checkForSnapshot: %v\n", rsm.me, err)
+				return
+			}
+			rsm.rf.Snapshot(idx, w.Bytes())
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
