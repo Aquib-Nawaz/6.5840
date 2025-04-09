@@ -2,10 +2,10 @@ package kvraft
 
 import (
 	//"log"
+	"fmt"
 	"strconv"
 	"testing"
 	"time"
-	"fmt"
 
 	"6.5840/kvraft1/rsm"
 	"6.5840/kvsrv1/rpc"

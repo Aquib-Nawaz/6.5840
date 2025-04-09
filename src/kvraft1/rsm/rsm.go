@@ -1,25 +1,33 @@
 package rsm
 
 import (
-	"sync"
+	"fmt"
+	"github.com/sasha-s/go-deadlock"
+	"time"
 
 	"6.5840/kvsrv1/rpc"
 	"6.5840/labrpc"
 	"6.5840/raft1"
 	"6.5840/raftapi"
 	"6.5840/tester1"
-
 )
 
 var useRaftStateMachine bool // to plug in another raft besided raft1
-
 
 type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
+	Me  int
+	Id  uint64
+	Req any
 }
 
+type RetOp struct {
+	Id  uint64
+	Rep any
+	Me  int
+}
 
 // A server (i.e., ../server.go) that wants to replicate itself calls
 // MakeRSM and must implement the StateMachine interface.  This
@@ -34,13 +42,16 @@ type StateMachine interface {
 }
 
 type RSM struct {
-	mu           sync.Mutex
+	mu           deadlock.Mutex
 	me           int
 	rf           raftapi.Raft
 	applyCh      chan raftapi.ApplyMsg
 	maxraftstate int // snapshot if log grows this big
 	sm           StateMachine
 	// Your definitions here.
+	id uint64
+	mp map[int]chan RetOp
+	//idxReceived int
 }
 
 // servers[] contains the ports of the set of
@@ -68,13 +79,15 @@ func MakeRSM(servers []*labrpc.ClientEnd, me int, persister *tester.Persister, m
 	if !useRaftStateMachine {
 		rsm.rf = raft.Make(servers, me, persister, rsm.applyCh)
 	}
+	rsm.mp = make(map[int]chan RetOp)
+	rsm.id = 1
+	go rsm.readApplyCh()
 	return rsm
 }
 
 func (rsm *RSM) Raft() raftapi.Raft {
 	return rsm.rf
 }
-
 
 // Submit a command to Raft, and wait for it to be committed.  It
 // should return ErrWrongLeader if client should find new leader and
@@ -86,5 +99,75 @@ func (rsm *RSM) Submit(req any) (rpc.Err, any) {
 	// is the argument to Submit and id is a unique id for the op.
 
 	// your code here
+	op := Op{
+		Me:  rsm.me,
+		Req: req,
+	}
+	//fmt.Printf("RSM:- %v Submit: %v\n", rsm.me, op)
+	if _, isLeader := rsm.Raft().GetState(); isLeader {
+		rsm.mu.Lock()
+		op.Id = rsm.id
+		rsm.id++
+		rsm.mu.Unlock()
+		idx, term, isLeader := rsm.Raft().Start(op)
+		if isLeader {
+			//fmt.Printf("RSM:- %v I am leader: %v\n", rsm.me, op)
+			ch := make(chan RetOp)
+			rsm.mu.Lock()
+			if val, ok := rsm.mp[idx]; ok {
+				close(val)
+			}
+			rsm.mp[idx] = ch
+			rsm.mu.Unlock()
+			run := true
+			for run {
+				select {
+				case msg, ok := <-ch:
+					fmt.Printf("RSM:- %v Received response: %v Waiting for Id %v\n", rsm.me, msg, op.Id)
+					if ok && msg.Id == op.Id && msg.Me == rsm.me {
+						fmt.Printf("RSM:- %v Received response: %v\n", rsm.me, op.Id)
+						return rpc.OK, msg.Rep
+					}
+					run = false
+				case <-time.After(time.Millisecond * 10):
+					//rsm.mu.Lock()
+					//fmt.Printf("RSM:- %v Waiting for response: %v curr received %v\n", rsm.me, op.Id, rsm.idxReceived)
+					if _term, _ := rsm.Raft().GetState(); _term > term {
+						fmt.Printf("RSM:- %v Timed out: %v\n", rsm.me, op.Id)
+						run = false
+						go func() {
+							<-ch
+						}()
+					}
+				}
+			}
+		}
+	}
 	return rpc.ErrWrongLeader, nil // i'm dead, try another server.
+}
+
+func (rsm *RSM) readApplyCh() {
+	for msg := range rsm.applyCh {
+		if msg.CommandValid {
+			op := msg.Command.(Op)
+			rep := rsm.sm.DoOp(op.Req)
+			rsm.mu.Lock()
+			//rsm.idxReceived = msg.CommandIndex
+			val, ok := rsm.mp[msg.CommandIndex]
+			rsm.mu.Unlock()
+			if ok {
+				toSend := RetOp{Id: op.Id, Rep: rep, Me: rsm.me}
+				fmt.Printf("RSM:- %v Sending response to submit routine: %v\n", rsm.me, toSend)
+				val <- toSend
+				close(val)
+				rsm.mu.Lock()
+				delete(rsm.mp, msg.CommandIndex)
+				rsm.mu.Unlock()
+			}
+		}
+	}
+	for _, ch := range rsm.mp {
+		close(ch)
+	}
+
 }

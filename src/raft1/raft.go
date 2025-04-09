@@ -51,6 +51,7 @@ type Raft struct {
 	logIdxOffset          int
 	lastApplied           int
 	snapshot              []byte
+	lastPersistedIndex    int
 }
 
 type InstallSnapshotRPCArgs struct {
@@ -131,7 +132,7 @@ func (rf *Raft) persist() {
 	}
 	e.Encode(toSave)
 	raftstate := w.Bytes()
-
+	rf.lastPersistedIndex = rf.logIdxOffset + len(rf.logs) - 1
 	rf.persister.Save(raftstate, rf.snapshot)
 
 }
@@ -188,7 +189,6 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	if prevOffset != rf.logIdxOffset {
 		rf.persist()
 	}
-	//rf.persist()
 	fmt.Printf("Peer:- %v Snapshot %v offset %v log length %v\n", rf.me, index, rf.logIdxOffset, len(rf.logs))
 
 }
@@ -241,6 +241,9 @@ func (rf *Raft) lastLogIndex() int {
 func (rf *Raft) createNewTerm(term int) {
 	rf.votedFor = -1
 	rf.currentTerm = term
+	if rf.isLeader {
+		rf.persist()
+	}
 	rf.isLeader = false
 }
 
@@ -301,14 +304,25 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		return
 	}
 
-	var prevLogLen = len(rf.logs)
-	rf.logs = rf.logs[:args.PrevLogIndex+1-rf.logIdxOffset]
-	rf.logs = append(rf.logs, args.Entries...)
-	if args.LeaderCommit > rf.commitIndex {
-		rf.applyCommittedEntries(min(args.LeaderCommit, len(rf.logs)-1+rf.logIdxOffset))
-	} else if prevLogLen != len(rf.logs) || len(args.Entries) > 0 {
+	//rf.logs = rf.logs[:args.PrevLogIndex+1-rf.logIdxOffset]
+	var idx int
+	for idx = max(args.PrevLogIndex, rf.commitIndex) + 1; idx < len(rf.logs)+rf.logIdxOffset && idx <= args.PrevLogIndex+len(args.Entries); idx++ {
+		if rf.logs[idx-rf.logIdxOffset].Term != args.Entries[idx-args.PrevLogIndex-1].Term {
+			rf.logs = rf.logs[:idx-rf.logIdxOffset]
+			break
+		}
+	}
+	if idx != len(args.Entries)+1+args.PrevLogIndex {
+		args.Entries = args.Entries[idx-args.PrevLogIndex-1:]
+		rf.logs = append(rf.logs, args.Entries...)
 		rf.persist()
 	}
+	//fmt.Printf("Peer:- %v Term:- %v Added logs at index %v logs %v got request for append %v\n", rf.me, rf.currentTerm,
+	//	args.PrevLogIndex+1, rf.logs[args.PrevLogIndex+1-rf.logIdxOffset:], args.Entries)
+	if args.LeaderCommit > rf.commitIndex {
+		rf.applyCommittedEntries(min(args.LeaderCommit, len(rf.logs)-1+rf.logIdxOffset))
+	}
+
 	reply.Success = 1
 	debugf(rf.me, fmt.Sprintf("Succesfully Replicated Entries %v at index %d", len(args.Entries), args.PrevLogIndex+1))
 }
@@ -318,15 +332,14 @@ func (rf *Raft) getEntryWithAbsoluteIndex(index int) LogEntry {
 }
 
 func (rf *Raft) applyCommittedEntries(nextCommit int) {
-	rf.persist()
 	if nextCommit > rf.commitIndex {
 		rf.commitIndex = nextCommit
 	}
-
 }
 
 func (rf *Raft) applyCommittedEntriesTicker() {
 	for rf.killed() == false {
+		time.Sleep(1 * time.Millisecond)
 		rf.mu.Lock()
 		toApply := make([]raftapi.ApplyMsg, 0)
 		if rf.snapshot != nil && rf.lastApplied < rf.logIdxOffset {
@@ -336,12 +349,12 @@ func (rf *Raft) applyCommittedEntriesTicker() {
 				SnapshotIndex: rf.logIdxOffset,
 				SnapshotTerm:  rf.logs[0].Term,
 			})
-			fmt.Printf("Peer:- %v Term:- %v Trying to apply snapshot till index %v\n", rf.me, rf.currentTerm,
-				rf.logIdxOffset)
+			//fmt.Printf("Peer:- %v Term:- %v Trying to apply snapshot till index %v\n", rf.me, rf.currentTerm,
+			//	rf.logIdxOffset)
 		} else {
 			if rf.commitIndex > rf.lastApplied {
-				fmt.Printf("Peer:- %v Term:- %v Trying to apply entries from %v till index %v with log offset %v\n",
-					rf.me, rf.currentTerm, rf.lastApplied+1, rf.commitIndex, rf.logIdxOffset)
+				//fmt.Printf("Peer:- %v Term:- %v Trying to apply entries from %v till index %v with log offset %v\n",
+				//rf.me, rf.currentTerm, rf.lastApplied+1, rf.commitIndex, rf.logIdxOffset)
 			}
 			for idx := rf.lastApplied + 1; idx <= rf.commitIndex; idx++ {
 				toApply = append(toApply, raftapi.ApplyMsg{
@@ -362,6 +375,7 @@ func (rf *Raft) applyCommittedEntriesTicker() {
 			}
 		}
 	}
+	close(rf.applyCh)
 }
 
 // example code to send a RequestVote RPC to a server.
@@ -406,6 +420,7 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 				debugf(rf.me, "becoming leader")
 				//fmt.Printf("Peer:- %v Term:- %v Became Leader\n", rf.me, rf.currentTerm)
 				rf.isLeader = true
+				rf.lastPersistedIndex = rf.logIdxOffset
 				for idx := range rf.peers {
 					rf.nextIndex[idx] = len(rf.logs) + rf.logIdxOffset
 					rf.matchIndex[idx] = 0
@@ -543,7 +558,7 @@ func (rf *Raft) sendAppendEntriesTicker() {
 		}
 
 		rf.mu.Unlock()
-		time.Sleep(150 * time.Millisecond)
+		time.Sleep(time.Duration(10*len(rf.peers)) * time.Millisecond)
 	}
 }
 
@@ -634,6 +649,9 @@ func (rf *Raft) checkForCommitIndexUpdate(replicatedIdx int) {
 			}
 		}
 		if 2*followersCommitted > len(rf.peers) {
+			if rf.lastPersistedIndex < i {
+				rf.persist()
+			}
 			rf.applyCommittedEntries(i)
 			break
 		}
