@@ -49,9 +49,9 @@ type RSM struct {
 	maxraftstate int // snapshot if log grows this big
 	sm           StateMachine
 	// Your definitions here.
-	id uint64
-	mp map[int]chan RetOp
-	//idxReceived int
+	id          uint64
+	mp          map[int]chan RetOp
+	idxReceived int
 }
 
 // servers[] contains the ports of the set of
@@ -82,6 +82,7 @@ func MakeRSM(servers []*labrpc.ClientEnd, me int, persister *tester.Persister, m
 	rsm.mp = make(map[int]chan RetOp)
 	rsm.id = 1
 	go rsm.readApplyCh()
+	go rsm.checkForSnapshot()
 	return rsm
 }
 
@@ -150,9 +151,9 @@ func (rsm *RSM) readApplyCh() {
 	for msg := range rsm.applyCh {
 		if msg.CommandValid {
 			op := msg.Command.(Op)
-			rep := rsm.sm.DoOp(op.Req)
 			rsm.mu.Lock()
-			//rsm.idxReceived = msg.CommandIndex
+			rep := rsm.sm.DoOp(op.Req)
+			rsm.idxReceived = msg.CommandIndex
 			val, ok := rsm.mp[msg.CommandIndex]
 			rsm.mu.Unlock()
 			if ok {
@@ -164,10 +165,33 @@ func (rsm *RSM) readApplyCh() {
 				delete(rsm.mp, msg.CommandIndex)
 				rsm.mu.Unlock()
 			}
+		} else if msg.SnapshotValid {
+			fmt.Printf("RSM:- %v Received snapshot: %v\n", rsm.me, msg.SnapshotIndex)
+			rsm.mu.Lock()
+			rsm.sm.Restore(msg.Snapshot)
+			rsm.idxReceived = msg.SnapshotIndex
+			rsm.mu.Unlock()
 		}
 	}
 	for _, ch := range rsm.mp {
 		close(ch)
 	}
 
+}
+
+func (rsm *RSM) checkForSnapshot() {
+	if rsm.maxraftstate == -1 {
+		return
+	}
+	for {
+		if rsm.rf.PersistBytes() > rsm.maxraftstate*9/10 {
+
+			rsm.mu.Lock()
+			snap := rsm.sm.Snapshot()
+			idx := rsm.idxReceived
+			rsm.mu.Unlock()
+			rsm.rf.Snapshot(idx, snap)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 }

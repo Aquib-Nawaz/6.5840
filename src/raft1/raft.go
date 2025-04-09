@@ -105,7 +105,6 @@ type EncodingInterface struct {
 	VotedFor          int
 	Logs              []LogEntry
 	LastSnapshotIndex int
-	LastSnapshotTerm  int
 }
 
 // save Raft's persistent state to stable storage,
@@ -126,10 +125,7 @@ func (rf *Raft) persist() {
 		fmt.Printf("Peer:- %v rf.persist\n", rf.me)
 	}
 	toSave := EncodingInterface{CurrentTerm: rf.currentTerm,
-		VotedFor: rf.votedFor, Logs: rf.logs}
-	if rf.logIdxOffset != 0 {
-		toSave.LastSnapshotIndex = rf.logIdxOffset
-	}
+		VotedFor: rf.votedFor, Logs: rf.logs, LastSnapshotIndex: rf.logIdxOffset}
 	e.Encode(toSave)
 	raftstate := w.Bytes()
 	rf.lastPersistedIndex = rf.logIdxOffset + len(rf.logs) - 1
